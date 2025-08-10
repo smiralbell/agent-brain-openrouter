@@ -1,119 +1,162 @@
 import express from "express";
-import axios from "axios";
-import 'dotenv/config';
+import { chromium } from "playwright-core";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// === ENV ===
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "google/gemini-2.5-flash-lite";
-const OPENROUTER_BASE = process.env.OPENROUTER_BASE || "https://openrouter.ai/api/v1";
-const OPENROUTER_REFERER = process.env.OPENROUTER_REFERER || ""; // optional but recommended
-const OPENROUTER_TITLE = process.env.OPENROUTER_TITLE || "Agent Brain (OpenRouter)";
+// URL WS/WSS de tu Browserless, p.ej.:
+//   ws://whatsap_browserless:3000?token=TU_TOKEN   (interna)
+//   wss://tu-browserless.dominio?token=TU_TOKEN    (pública con SSL)
+const WSS  = process.env.BROWSERLESS_WSS;
+const PORT = process.env.PORT || 3000;
 
-const AGENT_RUNNER_URL = (process.env.AGENT_RUNNER_URL || "http://whatsap_agent-runner").replace(/\/$/, "");
-
-if (!OPENROUTER_API_KEY) {
-  console.warn("[agent-brain-openrouter] WARNING: OPENROUTER_API_KEY is not set.");
-}
-if (!AGENT_RUNNER_URL) {
-  throw new Error("AGENT_RUNNER_URL is required");
+if (!WSS) {
+  console.warn("[agent-runner] WARNING: BROWSERLESS_WSS is not set");
 }
 
-const SYSTEM_PROMPT = `Eres un planificador de acciones web para un navegador controlado por API.
-Responde SOLO con JSON válido con este esquema:
-{
-  "steps": [
-    { "action": "goto|click|type|press|wait|extract|screenshot|done", "target": "<css|text=...|role=role:nombre>", "value": "<texto|tecla|selector|ms opcional>" }
-  ]
-}
-Reglas:
-- Máximo 12 pasos.
-- Si se proporciona startUrl, el primer paso DEBE ser {"action":"goto","target":"<startUrl>"}.
-- Usa "text=" cuando el objetivo sea un texto visible (ej. "text=More information").
-- En "type", pon el selector en "target" y el texto en "value".
-- Añade SIEMPRE una extracción al final (ej.: {"action":"extract","target":"body","value":"text"}).
-- Solo añade "screenshot" si el usuario lo pide.
-- Termina con {"action":"done","target":"","value":"<breve resumen>"}.
-`;
+// --------- Helpers ----------
+function locator(page, target = "") {
+  if (!target) return page.locator("body");
 
-function ensureJson(obj) {
-  if (!obj || typeof obj !== "object") throw new Error("No JSON");
-  if (!Array.isArray(obj.steps)) throw new Error("Falta 'steps'");
-  for (const s of obj.steps) {
-    if (!s.action) throw new Error("Paso sin 'action'");
-    s.action = String(s.action).toLowerCase();
-    s.target = s.target ?? "";
-    if (s.value === undefined) s.value = "";
+  // text=Visible text (parcial)
+  if (target.startsWith("text=")) {
+    const t = target.slice(5).trim();
+    return page.getByText(t, { exact: false });
   }
-  return obj;
+
+  // role=button:Login  | role=link:More information
+  if (target.startsWith("role=")) {
+    const [, rest] = target.split("=");
+    const [role, name = ""] = rest.split(":");
+    return page.getByRole(role.trim(), { name: name.trim() || undefined });
+  }
+
+  // CSS directo: #id, .clase, input[name=q], etc.
+  return page.locator(target);
 }
 
-async function chatPlan({ goal, startUrl = "" }) {
-  const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: `Objetivo: ${goal}${startUrl ? `\nstartUrl: ${startUrl}` : ""}` }
-  ];
+// --------- Core runner (con trace) ----------
+async function runSteps(steps = [], trace = false) {
+  if (!Array.isArray(steps)) throw new Error("steps must be an array");
+  if (!WSS) throw new Error("BROWSERLESS_WSS is not set");
 
-  const headers = {
-    "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
-    "Content-Type": "application/json",
-  };
-  if (OPENROUTER_REFERER) headers["HTTP-Referer"] = OPENROUTER_REFERER;
-  if (OPENROUTER_TITLE) headers["X-Title"] = OPENROUTER_TITLE;
+  const browser  = await chromium.connectOverCDP(WSS);
+  const page     = await browser.newPage();
+  const outputs  = [];
+  const timeline = [];     // capturas y metadatos por paso
 
-  const body = {
-    model: OPENROUTER_MODEL,
-    messages,
-    temperature: 0.2,
-    response_format: { type: "json_object" }
-  };
-
-  const url = `${OPENROUTER_BASE}/chat/completions`;
-  const resp = await axios.post(url, body, { headers, timeout: 60000 });
-  const txt = resp.data?.choices?.[0]?.message?.content || "{}";
-  let json;
   try {
-    json = JSON.parse(txt);
+    for (let i = 0; i < steps.length; i++) {
+      const s       = steps[i] || {};
+      const action  = String(s.action || "").toLowerCase();
+      const target  = s.target || "";
+      const value   = s.value ?? "";
+      const t0      = Date.now();
+
+      switch (action) {
+        case "goto":
+          await page.goto(target, { waitUntil: "domcontentloaded", timeout: 30000 });
+          break;
+
+        case "click":
+          await locator(page, target).first().click({ timeout: 15000 });
+          break;
+
+        case "type":
+          await locator(page, target).first().fill(String(value));
+          break;
+
+        case "press":
+          await page.keyboard.press(String(value || "Enter"));
+          break;
+
+        case "wait":
+          if (typeof value === "number") {
+            await page.waitForTimeout(value);
+          } else if (typeof value === "string" && value.trim()) {
+            await locator(page, value).first().waitFor({ state: "visible", timeout: 20000 });
+          } else {
+            await page.waitForTimeout(1000);
+          }
+          break;
+
+        case "extract": {
+          const mode = (String(value) || "text").toLowerCase(); // "text" | "html"
+          const result = await locator(page, target).first().evaluate((el, m) => {
+            if (!el) return null;
+            if (m === "html") return el.outerHTML;
+            return el.innerText || el.textContent || "";
+          }, mode);
+          outputs.push({ action, target, mode, result });
+          break;
+        }
+
+        case "screenshot": {
+          let buf;
+          if (target && target.trim()) {
+            const el = locator(page, target).first();
+            await el.waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
+            buf = await el.screenshot({ type: "png" });
+          } else {
+            buf = await page.screenshot({ fullPage: true, type: "png" });
+          }
+          outputs.push({ action, target, type: "png", base64: buf.toString("base64") });
+          break;
+        }
+
+        default:
+          outputs.push({ action, error: "Acción desconocida" });
+      }
+
+      // Deja que asiente la UI tras acciones que cambian la página
+      if (["goto", "click", "type", "press"].includes(action)) {
+        try { await page.waitForLoadState("networkidle", { timeout: 5000 }); } catch {}
+      }
+
+      // ----- TRACE: captura después de cada paso -----
+      if (trace) {
+        let shotB64 = "";
+        try {
+          const buf = await page.screenshot({ fullPage: true, type: "png" });
+          shotB64 = buf.toString("base64");
+        } catch {}
+        timeline.push({
+          i,
+          action,
+          target,
+          value: typeof value === "string" ? value.slice(0, 120) : value,
+          url: page.url(),
+          title: await page.title(),
+          elapsedMs: Date.now() - t0,
+          screenshotBase64: shotB64
+        });
+      }
+    }
+
+    const title = await page.title();
+    const url   = page.url();
+    await browser.close();
+    return { ok: true, url, title, outputs, timeline: trace ? timeline : undefined };
   } catch (e) {
-    // intenta rescatar JSON del texto
-    const m = txt.match(/\{[\s\S]*\}/);
-    if (m) json = JSON.parse(m[0]);
-    else throw new Error("El modelo no devolvió JSON válido");
+    await browser.close();
+    return { ok: false, error: e.message, outputs, timeline: trace ? timeline : undefined };
   }
-  json = ensureJson(json);
-  json.steps = json.steps.slice(0, 12);
-  return json;
 }
+
+// --------- HTTP API ----------
+app.post("/run", async (req, res) => {
+  try {
+    const { steps, trace = false } = req.body || {};
+    if (!Array.isArray(steps)) return res.status(400).json({ ok: false, error: "steps must be an array" });
+    const result = await runSteps(steps, !!trace);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
 
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-app.post("/plan", async (req, res) => {
-  try {
-    const { goal, startUrl = "" } = req.body || {};
-    if (!goal) return res.status(400).json({ ok: false, error: "goal is required" });
-    const plan = await chatPlan({ goal, startUrl });
-    res.json({ ok: true, plan });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: String(err?.message || err) });
-  }
+app.listen(PORT, () => {
+  console.log(`agent-runner listening on ${PORT}`);
 });
-
-app.post("/solve", async (req, res) => {
-  try {
-    const { goal, startUrl = "" } = req.body || {};
-    if (!goal) return res.status(400).json({ ok: false, error: "goal is required" });
-
-    const plan = await chatPlan({ goal, startUrl });
-
-    // Ejecutar plan en agent-runner
-    const run = await axios.post(`${AGENT_RUNNER_URL}/run`, plan, { timeout: 120000 });
-    res.json({ ok: true, plan, result: run.data });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: String(err?.message || err) });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[agent-brain-openrouter] listening on ${PORT}`));
